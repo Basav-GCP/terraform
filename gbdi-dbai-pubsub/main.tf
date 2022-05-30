@@ -1,8 +1,5 @@
-locals {
-  default_ack_deadline_seconds = 10
-  pubsub_svc_account_email     = "service-${data.google_project.project.number}@gcp-sa-pubsub.iam.gserviceaccount.com"
-}
-
+# setup pubsub topic and subscription for postgres
+# define schema - if message formating is required.
 resource "google_pubsub_schema" "schema" {
   count      = var.schema != null ? 1 : 0
   project    = var.project_id
@@ -10,41 +7,8 @@ resource "google_pubsub_schema" "schema" {
   type       = var.schema.type
   definition = var.schema.definition
 }
-
-resource "google_pubsub_topic_iam_member" "pull_topic_binding" {
-  for_each = var.create_topic ? { for i in var.pull_subscriptions : i.name => i } : {}
-  project = var.project_id
-  topic   = lookup(each.value, "dead_letter_topic", "projects/${var.project_id}/topics/${var.topic}")
-  role    = "roles/pubsub.publisher"
-  member  = "serviceAccount:${local.pubsub_svc_account_email}"
-  depends_on = [
-    google_pubsub_topic.topic,
-  ]
-}
-
-resource "google_pubsub_subscription_iam_member" "pull_subscription_binding" {
-  for_each = var.create_subscriptions ? { for i in var.pull_subscriptions : i.name => i } : {}
-  project      = var.project_id
-  subscription = each.value.name
-  role         = "roles/pubsub.subscriber"
-  member       = "serviceAccount:${local.pubsub_svc_account_email}"
-  depends_on = [
-    google_pubsub_subscription.pull_subscriptions,
-  ]
-}
-
-resource "google_pubsub_subscription_iam_member" "push_subscription_binding" {
-  for_each = var.create_subscriptions ? { for i in var.push_subscriptions : i.name => i } : {}
-  project      = var.project_id
-  subscription = each.value.name
-  role         = "roles/pubsub.subscriber"
-  member       = "serviceAccount:${local.pubsub_svc_account_email}"
-  depends_on = [
-    google_pubsub_subscription.push_subscriptions,
-  ]
-}
-
-resource "google_pubsub_topic" "topic" {
+# create topic - postgres-log-sink
+resource "google_pubsub_topic" "postgres-log-sink" {
   count        = var.create_topic ? 1 : 0
   project      = var.project_id
   name         = var.topic
@@ -65,85 +29,38 @@ resource "google_pubsub_topic" "topic" {
   }
   depends_on = [google_pubsub_schema.schema]
 }
-
-resource "google_pubsub_subscription" "pull_subscriptions" {
+# create subscription - postgres-log-subscription
+resource "google_pubsub_subscription" "postgres-log-subscription" {
   for_each = var.create_subscriptions ? { for i in var.pull_subscriptions : i.name => i } : {}
   name    = each.value.name
-  topic   = var.create_topic ? google_pubsub_topic.topic.0.name : var.topic
+  topic   = google_pubsub_topic.postgres-log-sink.id
   project = var.project_id
   labels  = var.subscription_labels
-  ack_deadline_seconds = lookup(
-    each.value,
-    "ack_deadline_seconds",
-    local.default_ack_deadline_seconds,
-  )
-  message_retention_duration = lookup(
-    each.value,
-    "message_retention_duration",
-    null,
-  )
-  retain_acked_messages = lookup(
-    each.value,
-    "retain_acked_messages",
-    null,
-  )
-  filter = lookup(
-    each.value,
-    "filter",
-    null,
-  )
-  enable_message_ordering = lookup(
-    each.value,
-    "enable_message_ordering",
-    null,
-  )
-  dynamic "expiration_policy" {
-    // check if the 'expiration_policy' key exists, if yes, return a list containing it.
-    for_each = contains(keys(each.value), "expiration_policy") ? [each.value.expiration_policy] : []
-    content {
-      ttl = expiration_policy.value
-    }
-  }
-
-  dynamic "dead_letter_policy" {
-    for_each = (lookup(each.value, "dead_letter_topic", "") != "") ? [each.value.dead_letter_topic] : []
-    content {
-      dead_letter_topic     = lookup(each.value, "dead_letter_topic", "")
-      max_delivery_attempts = lookup(each.value, "max_delivery_attempts", "5")
-    }
-  }
-
-  dynamic "retry_policy" {
-    for_each = (lookup(each.value, "maximum_backoff", "") != "") ? [each.value.maximum_backoff] : []
-    content {
-      maximum_backoff = lookup(each.value, "maximum_backoff", "")
-      minimum_backoff = lookup(each.value, "minimum_backoff", "")
-    }
-  }
-
+  message_retention_duration = "86400s"
   depends_on = [
-    google_pubsub_topic.topic,
+    google_pubsub_topic.postgres-log-sink
   ]
 }
 
-resource "google_pubsub_subscription_iam_member" "pull_subscription_sa_binding_subscriber" {
-  for_each = var.create_subscriptions ? { for i in var.pull_subscriptions : i.name => i if lookup(i, "service_account", null) != null } : {}
+resource "google_pubsub_topic_iam_member" "postgres-log-writer" {
+  project = var.project_id
+  topic   = google_pubsub_topic.postgres-log-sink.id
+  role    = "roles/pubsub.publisher"
+  member  = [
+    google_logging_organization_sink.postgres-sink.writer_identity,
+  ]
+  depends_on = [
+    google_pubsub_topic.postgres-log-sink
+  ]
+}
+
+resource "google_pubsub_subscription_iam_member" "postgres-log-subscription" {
+  for_each = var.create_subscriptions ? { for i in var.pull_subscriptions : i.name => i } : {}
   project      = var.project_id
   subscription = each.value.name
   role         = "roles/pubsub.subscriber"
-  member       = "serviceAccount:${each.value.service_account}"
+  member       = "serviceAccount:${var.impervasa}"
   depends_on = [
-    google_pubsub_subscription.pull_subscriptions,
-  ]
-}
-
-resource "google_pubsub_subscription_iam_member" "pull_subscription_sa_binding_viewer" {
-  for_each = var.create_subscriptions ? { for i in var.pull_subscriptions : i.name => i if lookup(i, "service_account", null) != null } : {}
-  project      = var.project_id
-  subscription = each.value.name
-  role         = "roles/pubsub.viewer"
-  member       = "serviceAccount:${each.value.service_account}"
-  depends_on = [
-    google_pubsub_subscription.pull_subscriptions,
+    google_pubsub_subscription.postgres-log-subscription
   ]
 }
